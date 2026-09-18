@@ -51,19 +51,59 @@ fi
 [[ -f "$KSU_PATCH" ]] || { echo "Missing SUSFS KernelSU patch." >&2; exit 1; }
 [[ -n "$KERNEL_PATCH" && -f "$KERNEL_PATCH" ]] || { echo "Missing SUSFS 5.15 kernel patch." >&2; exit 1; }
 
-echo
-echo "Dry-running SUSFS patches before touching source..."
-(
-  cd "$KERNEL/KernelSU-Next"
-  patch --dry-run -p1 < "$KSU_PATCH"
-)
-(
-  cd "$KERNEL"
-  patch --dry-run -p1 < "$KERNEL_PATCH"
-)
+classify_patch() {
+  local tree="$1"
+  local patchfile="$2"
+
+  if git -C "$tree" apply --check "$patchfile" >/dev/null 2>&1; then
+    echo "APPLIES"
+  elif git -C "$tree" apply --reverse --check "$patchfile" >/dev/null 2>&1; then
+    echo "REVERSE_MATCH"
+  else
+    echo "CONFLICT"
+  fi
+}
 
 echo
-echo "PASS: KernelSU Next and SUSFS patches are structurally compatible."
-echo "No SUSFS patch has been applied yet."
+echo "Checking SUSFS patches non-interactively..."
+ksu_state="$(classify_patch "$KERNEL/KernelSU-Next" "$KSU_PATCH")"
+kernel_state="$(classify_patch "$KERNEL" "$KERNEL_PATCH")"
+
+echo "KernelSU-Next patch: $ksu_state"
+echo "GKI 5.15 kernel patch: $kernel_state"
 echo "Kernel patch: $KERNEL_PATCH"
+
+case "$ksu_state" in
+  APPLIES)
+    echo "OK: SUSFS KernelSU patch can be applied cleanly."
+    ;;
+  REVERSE_MATCH)
+    echo "STOP: SUSFS KernelSU patch matches in reverse against KernelSU Next."
+    echo "Do NOT reverse it. This usually means the current KernelSU Next tree already contains overlapping changes or the patch targets a different KernelSU baseline."
+    exit 2
+    ;;
+  CONFLICT)
+    echo "STOP: SUSFS KernelSU patch does not cleanly apply to KernelSU Next $KSUN_TAG."
+    echo "It needs a KernelSU-Next-specific adaptation before we modify source."
+    exit 3
+    ;;
+esac
+
+case "$kernel_state" in
+  APPLIES)
+    echo "OK: SUSFS Android 13 / 5.15 kernel patch can be applied cleanly."
+    ;;
+  REVERSE_MATCH)
+    echo "STOP: GKI kernel patch appears already applied or reverse-compatible. Do NOT reverse it."
+    exit 4
+    ;;
+  CONFLICT)
+    echo "STOP: SUSFS GKI 5.15 patch conflicts with this exact ACK tree."
+    exit 5
+    ;;
+esac
+
+echo
+echo "PASS: both patches can be applied cleanly."
+echo "No SUSFS patch has been applied yet."
 echo "[4/4] Preparation complete."
