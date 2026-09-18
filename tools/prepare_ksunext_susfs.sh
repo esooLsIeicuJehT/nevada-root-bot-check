@@ -4,106 +4,106 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KERNEL="${KERNEL:-$ROOT/kernel-src/android13-5.15}"
 SUSFS="${SUSFS:-$ROOT/kernel-src/susfs4ksu}"
-EXPECTED_COMMIT="9b2308ac0ad616788fb57ba688aa07f0ff221355"
-KSUN_TAG="v3.3.0"
+
+EXPECTED_GKI_COMMIT="9b2308ac0ad616788fb57ba688aa07f0ff221355"
+KSUN_REPO="https://github.com/pershoot/KernelSU-Next.git"
+KSUN_BRANCH="dev-susfs"
+KSUN_COMMIT="5dfc3359e1cf2f4d953c74205c8d06e6eaadbec0"
+SUSFS_REPO="https://gitlab.com/simonpunk/susfs4ksu.git"
 SUSFS_BRANCH="gki-android13-5.15"
 
 [[ -d "$KERNEL/.git" ]] || { echo "Missing kernel tree: $KERNEL" >&2; exit 1; }
 cd "$KERNEL"
 
 actual="$(git rev-parse HEAD)"
-[[ "$actual" == "$EXPECTED_COMMIT" ]] || {
-  echo "Wrong kernel commit: $actual" >&2
-  echo "Expected: $EXPECTED_COMMIT" >&2
+[[ "$actual" == "$EXPECTED_GKI_COMMIT" ]] || {
+  echo "Wrong GKI commit: $actual" >&2
+  echo "Expected: $EXPECTED_GKI_COMMIT" >&2
   exit 1
 }
-
 [[ "$(make -s kernelversion)" == "5.15.180" ]] || {
   echo "Kernel version is not 5.15.180" >&2
   exit 1
 }
+echo "[1/5] Exact Nevada GKI baseline confirmed."
 
-echo "[1/4] Exact Nevada GKI baseline confirmed."
+DRIVERS="$KERNEL/drivers"
 
-if [[ ! -d "$KERNEL/KernelSU-Next/.git" ]]; then
-  curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/$KSUN_TAG/kernel/setup.sh" |
-    bash -s "$KSUN_TAG"
-else
-  echo "[2/4] KernelSU-Next already present; leaving it untouched."
+cleanup_ksu_integration() {
+  rm -f "$DRIVERS/kernelsu"
+  sed -i '/obj-$(CONFIG_KSU) += kernelsu\//d' "$DRIVERS/Makefile"
+  sed -i '/source "drivers\/kernelsu\/Kconfig"/d' "$DRIVERS/Kconfig"
+  rm -rf "$KERNEL/KernelSU-Next"
+}
+
+need_ksu=1
+if [[ -d "$KERNEL/KernelSU-Next/.git" ]]; then
+  current="$(git -C "$KERNEL/KernelSU-Next" rev-parse HEAD 2>/dev/null || true)"
+  if [[ "$current" == "$KSUN_COMMIT" ]] && grep -q 'config KSU_SUSFS' "$KERNEL/KernelSU-Next/kernel/Kconfig"; then
+    need_ksu=0
+  fi
 fi
 
+if [[ "$need_ksu" -eq 1 ]]; then
+  echo "[2/5] Replacing generic KernelSU Next with SUSFS-native dev-susfs integration..."
+  cleanup_ksu_integration
+
+  git clone --no-checkout "$KSUN_REPO" "$KERNEL/KernelSU-Next"
+  git -C "$KERNEL/KernelSU-Next" fetch --depth=1 origin "$KSUN_COMMIT"
+  git -C "$KERNEL/KernelSU-Next" checkout --detach "$KSUN_COMMIT"
+
+  ln -s "$(realpath --relative-to="$DRIVERS" "$KERNEL/KernelSU-Next/kernel")" "$DRIVERS/kernelsu"
+  grep -q 'obj-$(CONFIG_KSU) += kernelsu/' "$DRIVERS/Makefile" ||
+    printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> "$DRIVERS/Makefile"
+  grep -q 'source "drivers/kernelsu/Kconfig"' "$DRIVERS/Kconfig" ||
+    sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' "$DRIVERS/Kconfig"
+else
+  echo "[2/5] SUSFS-native KernelSU Next already installed."
+fi
+
+grep -q 'config KSU_SUSFS' "$KERNEL/KernelSU-Next/kernel/Kconfig" || {
+  echo "KernelSU Next checkout does not expose CONFIG_KSU_SUSFS." >&2
+  exit 2
+}
+echo "      KernelSU Next dev-susfs: $(git -C "$KERNEL/KernelSU-Next" rev-parse --short=12 HEAD)"
+
 if [[ ! -d "$SUSFS/.git" ]]; then
-  git clone --depth=1 --branch "$SUSFS_BRANCH"     https://gitlab.com/simonpunk/susfs4ksu.git "$SUSFS"
+  git clone --depth=1 --branch "$SUSFS_BRANCH" "$SUSFS_REPO" "$SUSFS"
 else
   git -C "$SUSFS" fetch --depth=1 origin "$SUSFS_BRANCH"
   git -C "$SUSFS" checkout "$SUSFS_BRANCH"
   git -C "$SUSFS" reset --hard "origin/$SUSFS_BRANCH"
 fi
+echo "[3/5] SUSFS source ready: $(git -C "$SUSFS" rev-parse --short=12 HEAD)"
 
-echo "[3/4] SUSFS source ready: $(git -C "$SUSFS" rev-parse --short=12 HEAD)"
+KERNEL_PATCH="$SUSFS/kernel_patches/50_add_susfs_in_gki-android13-5.15.patch"
+[[ -f "$KERNEL_PATCH" ]] || {
+  echo "Missing Android13-5.15 SUSFS kernel patch: $KERNEL_PATCH" >&2
+  exit 3
+}
+[[ -f "$SUSFS/kernel_patches/fs/susfs.c" ]] || { echo "Missing fs/susfs.c" >&2; exit 3; }
+[[ -f "$SUSFS/kernel_patches/include/linux/susfs.h" ]] || { echo "Missing include/linux/susfs.h" >&2; exit 3; }
 
-KSU_PATCH="$SUSFS/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
-KERNEL_PATCH="$(find "$SUSFS/kernel_patches" -maxdepth 1 -type f -name '50_add_susfs*5.15*.patch' | head -n1)"
-if [[ -z "$KERNEL_PATCH" ]]; then
-  KERNEL_PATCH="$(find "$SUSFS/kernel_patches" -maxdepth 1 -type f -name '50_add_susfs*.patch' | head -n1)"
+echo "[4/5] Dry-running Android13-5.15 SUSFS kernel patch..."
+tmp="$(mktemp)"
+set +e
+(
+  cd "$KERNEL"
+  patch --dry-run --batch --forward -p1 < "$KERNEL_PATCH"
+) >"$tmp" 2>&1
+rc=$?
+set -e
+cat "$tmp"
+rm -f "$tmp"
+
+if [[ "$rc" -ne 0 ]]; then
+  echo
+  echo "STOP: kernel-side SUSFS patch still needs adaptation for ACK 5.15.180 r14."
+  echo "No SUSFS kernel patch was applied."
+  exit 4
 fi
 
-[[ -f "$KSU_PATCH" ]] || { echo "Missing SUSFS KernelSU patch." >&2; exit 1; }
-[[ -n "$KERNEL_PATCH" && -f "$KERNEL_PATCH" ]] || { echo "Missing SUSFS 5.15 kernel patch." >&2; exit 1; }
-
-classify_patch() {
-  local tree="$1"
-  local patchfile="$2"
-
-  if git -C "$tree" apply --check "$patchfile" >/dev/null 2>&1; then
-    echo "APPLIES"
-  elif git -C "$tree" apply --reverse --check "$patchfile" >/dev/null 2>&1; then
-    echo "REVERSE_MATCH"
-  else
-    echo "CONFLICT"
-  fi
-}
-
-echo
-echo "Checking SUSFS patches non-interactively..."
-ksu_state="$(classify_patch "$KERNEL/KernelSU-Next" "$KSU_PATCH")"
-kernel_state="$(classify_patch "$KERNEL" "$KERNEL_PATCH")"
-
-echo "KernelSU-Next patch: $ksu_state"
-echo "GKI 5.15 kernel patch: $kernel_state"
-echo "Kernel patch: $KERNEL_PATCH"
-
-case "$ksu_state" in
-  APPLIES)
-    echo "OK: SUSFS KernelSU patch can be applied cleanly."
-    ;;
-  REVERSE_MATCH)
-    echo "STOP: SUSFS KernelSU patch matches in reverse against KernelSU Next."
-    echo "Do NOT reverse it. This usually means the current KernelSU Next tree already contains overlapping changes or the patch targets a different KernelSU baseline."
-    exit 2
-    ;;
-  CONFLICT)
-    echo "STOP: SUSFS KernelSU patch does not cleanly apply to KernelSU Next $KSUN_TAG."
-    echo "It needs a KernelSU-Next-specific adaptation before we modify source."
-    exit 3
-    ;;
-esac
-
-case "$kernel_state" in
-  APPLIES)
-    echo "OK: SUSFS Android 13 / 5.15 kernel patch can be applied cleanly."
-    ;;
-  REVERSE_MATCH)
-    echo "STOP: GKI kernel patch appears already applied or reverse-compatible. Do NOT reverse it."
-    exit 4
-    ;;
-  CONFLICT)
-    echo "STOP: SUSFS GKI 5.15 patch conflicts with this exact ACK tree."
-    exit 5
-    ;;
-esac
-
-echo
-echo "PASS: both patches can be applied cleanly."
-echo "No SUSFS patch has been applied yet."
-echo "[4/4] Preparation complete."
+echo "[5/5] PASS"
+echo "KernelSU Next dev-susfs is integrated."
+echo "Android13-5.15 SUSFS kernel patch dry-run succeeded."
+echo "No SUSFS kernel filesystem patch has been applied yet."
