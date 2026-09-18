@@ -109,3 +109,20 @@ Do not publish or redistribute Motorola proprietary firmware images. Publish scr
 Do not use the Motorola full XML flashing sequence for kernel testing. It also contains destructive userdata / metadata operations and unrelated firmware partitions.
 
 Keep an untouched verified W1WNS36.18-114-1 boot image for recovery.
+
+
+## Fedora / Nobara OpenSSL 3 module-signing note
+
+Modern Fedora / Nobara releases reject SHA-1 signature creation through OpenSSL. The Android 13 / 5.15 GKI configuration can still select `CONFIG_MODULE_SIG_SHA1=y`, which causes the build to fail while generating `certs/signing_key.pem` with:
+
+```
+error:03000098:digital envelope routines:do_sigver_init:invalid digest
+```
+
+The build script explicitly switches the module-signing hash to SHA-512 before `olddefconfig`:
+
+```
+CONFIG_MODULE_SIG_SHA512=y
+```
+
+This follows the upstream Linux fix for the same Fedora/OpenSSL failure and avoids lowering the host system crypto policy.
