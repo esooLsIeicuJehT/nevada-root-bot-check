@@ -58,12 +58,19 @@ mkdir -p "$OUT"
 echo "=== DEFCONFIG ==="
 make -C "$KERNEL" O="$OUT" gki_defconfig
 
-"$KERNEL/scripts/config" --file "$OUT/.config"   -e KSU   -e KSU_SUSFS
+"$KERNEL/scripts/config" --file "$OUT/.config" \
+  -e KSU \
+  -e KSU_SUSFS \
+  -d MODULE_SIG_SHA1 \
+  -d MODULE_SIG_SHA224 \
+  -d MODULE_SIG_SHA256 \
+  -d MODULE_SIG_SHA384 \
+  -e MODULE_SIG_SHA512
 
 make -C "$KERNEL" O="$OUT" olddefconfig
 
 echo "=== ENABLED ==="
-grep -E '^(CONFIG_KSU|CONFIG_KSU_SUSFS)=' "$OUT/.config"
+grep -E '^(CONFIG_KSU|CONFIG_KSU_SUSFS|CONFIG_MODULE_SIG_SHA[0-9_]+)=' "$OUT/.config"
 
 echo "=== BUILD ==="
 make -C "$KERNEL" O="$OUT" -j"$(nproc)" Image Image.gz
